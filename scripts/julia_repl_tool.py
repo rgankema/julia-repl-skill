@@ -11,6 +11,7 @@ import os
 import socket
 import signal
 import hashlib
+import codecs
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -32,8 +33,18 @@ def _stream_and_collect(sock, echo: bool = True) -> Optional[Dict[str, Any]]:
     sentinel is accumulated until it parses as JSON, which is returned. Returns
     None if the connection closes before a complete result is received.
     """
+    # Incremental decoder so a multibyte UTF-8 character split across TCP
+    # segments is buffered until complete instead of raising UnicodeDecodeError.
+    decoder = codecs.getincrementaldecoder('utf-8')()
     buffer = ""
     holdback = len(RESULT_SENTINEL) - 1
+
+    def recv_text():
+        """Return (decoded_text, closed). closed is True at end of stream."""
+        raw = sock.recv(4096)
+        if not raw:
+            return decoder.decode(b'', final=True), True
+        return decoder.decode(raw), False
 
     # Phase 1: stream output until the sentinel appears.
     while True:
@@ -44,30 +55,32 @@ def _stream_and_collect(sock, echo: bool = True) -> Optional[Dict[str, Any]]:
             buffer = buffer[idx + len(RESULT_SENTINEL):]
             break
 
-        # No complete sentinel yet. Emit everything except a possible partial
-        # sentinel at the tail (holdback bytes), then read more.
-        if echo and len(buffer) > holdback:
+        # No complete sentinel yet. Trim everything except a possible partial
+        # sentinel at the tail (holdback chars) so the buffer can't grow
+        # unbounded; print the trimmed prefix only when echoing.
+        if len(buffer) > holdback:
             safe = len(buffer) - holdback
-            print(buffer[:safe], end='', flush=True)
+            if echo:
+                print(buffer[:safe], end='', flush=True)
             buffer = buffer[safe:]
 
-        chunk = sock.recv(4096).decode()
-        if not chunk:
+        text, closed = recv_text()
+        if closed:
             # Connection closed without a sentinel; flush whatever remains.
             if echo and buffer:
                 print(buffer, end='', flush=True)
             return None
-        buffer += chunk
+        buffer += text
 
     # Phase 2: accumulate the JSON result until it parses.
     while True:
         try:
             return json.loads(buffer.strip())
         except json.JSONDecodeError:
-            chunk = sock.recv(4096).decode()
-            if not chunk:
+            text, closed = recv_text()
+            if closed:
                 return None
-            buffer += chunk
+            buffer += text
 
 
 class SessionRegistry:
@@ -413,9 +426,10 @@ class JuliaREPLServer:
                         
                     output_lines.append(line)
                     
-                    # Send line immediately to client for streaming
+                    # Send line immediately to client for streaming.
+                    # sendall so a long line is transmitted in full.
                     line_data = line + "\\n"
-                    conn.send(line_data.encode())
+                    conn.sendall(line_data.encode())
                     
                     if log_handle:
                         log_handle.write(line + "\\n")
@@ -433,8 +447,9 @@ class JuliaREPLServer:
                     "error": None
                 }
 
-                conn.send(result_sentinel.encode())
-                conn.send(json.dumps(result).encode())
+                # sendall so partial sends can't corrupt the result framing.
+                conn.sendall(result_sentinel.encode())
+                conn.sendall(json.dumps(result).encode())
 
             except Exception as e:
                 if log_handle:
@@ -445,9 +460,9 @@ class JuliaREPLServer:
                     "output": "",
                     "error": str(e)
                 }
-                conn.send(result_sentinel.encode())
-                conn.send(json.dumps(error_result).encode())
-    
+                conn.sendall(result_sentinel.encode())
+                conn.sendall(json.dumps(error_result).encode())
+
     def handle_client(self, conn):
         """Handle client connection."""
         try:
@@ -764,7 +779,12 @@ def main():
         sock.close()
 
         # Surface a failing status (output has already been streamed above).
-        if result is not None and not result.get("success", True):
+        if result is None:
+            # Connection closed before the sentinel/JSON result arrived.
+            print("Error: connection closed before result was received",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not result.get("success", True):
             error = result.get("error")
             if error:
                 print(f"Error: {error}", file=sys.stderr)
