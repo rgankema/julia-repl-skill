@@ -15,6 +15,61 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 
+# Unique sentinel emitted by the server on its own, immediately before the final
+# JSON result. It lets the client separate streamed program output from the
+# result unambiguously, instead of guessing by brace-matching (which breaks
+# because TCP does not preserve send() boundaries and Julia can print braces).
+# This literal MUST stay in sync with the copy embedded in the server script
+# inside JuliaREPLClient.create_server_script().
+RESULT_SENTINEL = "##JULIA_REPL_RESULT_JSON##"
+
+
+def _stream_and_collect(sock, echo: bool = True) -> Optional[Dict[str, Any]]:
+    """Read streamed output followed by the sentinel-delimited JSON result.
+
+    Everything received before RESULT_SENTINEL is streamed program output; when
+    ``echo`` is True it is printed to stdout as it arrives. Everything after the
+    sentinel is accumulated until it parses as JSON, which is returned. Returns
+    None if the connection closes before a complete result is received.
+    """
+    buffer = ""
+    holdback = len(RESULT_SENTINEL) - 1
+
+    # Phase 1: stream output until the sentinel appears.
+    while True:
+        idx = buffer.find(RESULT_SENTINEL)
+        if idx != -1:
+            if echo and idx > 0:
+                print(buffer[:idx], end='', flush=True)
+            buffer = buffer[idx + len(RESULT_SENTINEL):]
+            break
+
+        # No complete sentinel yet. Emit everything except a possible partial
+        # sentinel at the tail (holdback bytes), then read more.
+        if echo and len(buffer) > holdback:
+            safe = len(buffer) - holdback
+            print(buffer[:safe], end='', flush=True)
+            buffer = buffer[safe:]
+
+        chunk = sock.recv(4096).decode()
+        if not chunk:
+            # Connection closed without a sentinel; flush whatever remains.
+            if echo and buffer:
+                print(buffer, end='', flush=True)
+            return None
+        buffer += chunk
+
+    # Phase 2: accumulate the JSON result until it parses.
+    while True:
+        try:
+            return json.loads(buffer.strip())
+        except json.JSONDecodeError:
+            chunk = sock.recv(4096).decode()
+            if not chunk:
+                return None
+            buffer += chunk
+
+
 class SessionRegistry:
     """Manages persistent Julia REPL sessions and their port assignments."""
 
@@ -294,14 +349,18 @@ class JuliaREPLServer:
         with self.lock:
             if not self.process or self.process.poll() is not None:
                 self.start_julia()
-                
+
+            # Sentinel emitted right before the JSON result so the client can
+            # separate streamed output from the result. MUST match
+            # RESULT_SENTINEL in the client module.
+            result_sentinel = "##JULIA_REPL_RESULT_JSON##"
+            log_handle = None
             try:
                 code = request["code"]
                 timeout = request.get("timeout", 3600)
                 log_file = request.get("log_file")
-                
+
                 # Open log file if specified
-                log_handle = None
                 if log_file:
                     log_handle = open(log_file, 'a')
                     log_handle.write(f"\\n=== Julia Command Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\\n")
@@ -366,19 +425,17 @@ class JuliaREPLServer:
                     log_handle.write(f"=== Command Completed at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\\n\\n")
                     log_handle.close()
                 
-                # Send final JSON result
+                # Send final JSON result, preceded by the sentinel line so the
+                # client can unambiguously find the result boundary.
                 result = {
                     "success": True,
                     "output": "\\n".join(output_lines),
                     "error": None
                 }
-                
-                if restarted:
-                    result["server_restarted"] = True
-                    result["restart_reason"] = "Revise error detected"
-                
+
+                conn.send(result_sentinel.encode())
                 conn.send(json.dumps(result).encode())
-                
+
             except Exception as e:
                 if log_handle:
                     log_handle.write(f"ERROR: {str(e)}\\n")
@@ -388,6 +445,7 @@ class JuliaREPLServer:
                     "output": "",
                     "error": str(e)
                 }
+                conn.send(result_sentinel.encode())
                 conn.send(json.dumps(error_result).encode())
     
     def handle_client(self, conn):
@@ -527,20 +585,16 @@ if __name__ == "__main__":
 
             # All execute commands now stream by default
             if command == "execute":
-                # Receive and print output in real-time, then collect JSON result at the end
-                buffer = ""
-                while True:
-                    chunk = sock.recv(1024).decode()
-                    if not chunk:
-                        break
-                    buffer += chunk
-                    # Try to parse complete JSON response
-                    try:
-                        result = json.loads(buffer)
-                        break
-                    except json.JSONDecodeError:
-                        continue  # Keep receiving until we have complete JSON
+                # Print output in real-time, then collect the JSON result that
+                # follows the sentinel.
+                result = _stream_and_collect(sock, echo=True)
                 sock.close()
+                if result is None:
+                    return {
+                        "success": False,
+                        "output": "",
+                        "error": "Connection closed before result was received",
+                    }
                 return result
             else:
                 # Non-execute commands get simple response
@@ -704,25 +758,17 @@ def main():
         request = {"command": "execute", "code": code, "timeout": timeout, "log_file": log_file}
         sock.send(json.dumps(request).encode())
 
-        # Read and display output in real-time
-        while True:
-            data = sock.recv(1024).decode()
-            if not data:
-                break
-
-            # Check if this contains JSON (final result)
-            if data.strip().startswith('{') and data.strip().endswith('}'):
-                # Final JSON result, parse and exit
-                try:
-                    result = json.loads(data.strip())
-                    break
-                except json.JSONDecodeError:
-                    pass
-
-            # Regular output, print it
-            print(data, end='', flush=True)
-
+        # Stream output in real-time and collect the final JSON result, which is
+        # delimited by RESULT_SENTINEL so it never leaks into stdout.
+        result = _stream_and_collect(sock, echo=True)
         sock.close()
+
+        # Surface a failing status (output has already been streamed above).
+        if result is not None and not result.get("success", True):
+            error = result.get("error")
+            if error:
+                print(f"Error: {error}", file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
