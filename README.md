@@ -37,3 +37,16 @@ Once installed, invoke the skill in any Claude Code session:
 Or just ask Claude to run Julia code — if you've added the CLAUDE.md instruction above, it will use the persistent REPL automatically.
 
 See [SKILL.md](SKILL.md) for full documentation on session management, testing workflows, and advanced options.
+
+## Development
+
+Run the test suite:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The fast tests drive the server against a controllable stub REPL (no Julia needed)
+and cover the timeout → interrupt → kill/restart self-healing, crash recovery, the
+busy fast-fail, and the streaming protocol. The end-to-end integration test runs the
+real CLI against `julia` and is skipped automatically when Julia isn't on `PATH`.

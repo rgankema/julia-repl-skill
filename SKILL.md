@@ -121,15 +121,39 @@ python3 $CLAUDE_SKILL_DIR/scripts/julia_repl_tool.py "" --reset
 
 **Tip**: Revise may suggest `Revise.retry()` for evaluation order issues - try that before a full reset.
 
+## Timeouts and Self-Healing
+
+Commands are bounded by a wall-clock timeout (`--timeout=N`, default 3600s) that is
+enforced **even if Julia goes completely silent** (long precompile, infinite loop,
+crash, or code waiting on stdin such as `readline()` or a debugger prompt).
+
+When a command exceeds its timeout the session recovers automatically — you do **not**
+need to run `--reset` manually:
+
+1. The tool sends an interrupt (Ctrl-C) to Julia. If the REPL recovers, your session
+   **state is preserved** and you get a timeout error result.
+2. If the interrupt doesn't help (e.g. a tight `while true end` loop or a consumed
+   stdin), Julia is killed and restarted. The session is usable again immediately, but
+   **variables/compilation state are lost** (like a fresh REPL).
+
+While a command is running, the tool prints a progress line to stderr
+(`[julia-repl] running… Ns`) so a long-but-alive precompile isn't mistaken for a hang.
+A timed-out or failed command exits non-zero and prints the reason to stderr.
+
+If you send a command while another is still running in the same session, it fails fast
+with a "Session busy" message instead of blocking. Use `--reset` to recover a session
+that is genuinely stuck.
+
 ## Available Options
 
 - `--session=NAME`: Use explicit session ID
 - `--global`: Use global session (for one-off commands)
-- `--reset`: Reset the Julia session before execution
+- `--reset`: Reset the Julia session before execution (recovers a stuck session)
 - `--shutdown`: Shutdown the session
-- `--timeout=N`: Set timeout in seconds (default: 3600)
+- `--timeout=N`: Wall-clock timeout in seconds (default: 3600). Honored even when Julia
+  is silent; on expiry the session interrupts, then restarts if needed, and self-heals.
 - `--log=FILE`: Log output to file
-- `--list`: List all active sessions
+- `--list`: List all active sessions (shows `idle`, `busy (Ns)`, or `stale`)
 - `--cleanup`: Clean up stale sessions
 
 ## Best Practices
