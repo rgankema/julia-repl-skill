@@ -171,8 +171,9 @@ class ServerLogicTests(unittest.TestCase):
             self.server.busy_since = None
 
 
-class ProtocolTests(unittest.TestCase):
-    """Exercise the client-side NDJSON reader over an in-memory socketpair."""
+class ClientTimeoutTests(unittest.TestCase):
+    """The client reader's socket-timeout / give-up behavior, which needs a real
+    socket (the deterministic framing matrix lives in test_julia_repl_tool.py)."""
 
     def setUp(self):
         self.client, self.server = socket.socketpair()
@@ -184,54 +185,38 @@ class ProtocolTests(unittest.TestCase):
             except Exception:
                 pass
 
-    def _send(self, obj):
-        self.server.sendall((json.dumps(obj) + "\n").encode())
-
-    def _read(self, **kw):
-        # Swallow the echoed output/progress so tests stay quiet.
-        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
-            res = read_execute_stream(self.client, **kw)
-        return res, out.getvalue()
-
-    def test_output_then_result(self):
-        self._send({"type": "output", "data": "line-one\n"})
-        self._send({"type": "result", "success": True,
-                    "output": "line-one", "error": None})
-        res, echoed = self._read(heartbeat_interval=1, idle_limit=5)
-        self.assertTrue(res["success"])
-        self.assertIn("line-one", echoed)
-
-    def test_heartbeats_do_not_break_stream(self):
-        self._send({"type": "heartbeat", "elapsed": 1})
-        self._send({"type": "heartbeat", "elapsed": 2})
-        self._send({"type": "result", "success": True, "output": "", "error": None})
-        res, _ = self._read(heartbeat_interval=1, idle_limit=5)
-        self.assertTrue(res["success"])
-
-    def test_message_split_across_recv_boundaries(self):
-        payload = (json.dumps({"type": "result", "success": True,
-                               "output": "chunked", "error": None}) + "\n").encode()
-
-        def writer():
-            self.server.sendall(payload[:12])
-            time.sleep(0.2)
-            self.server.sendall(payload[12:])
-
-        t = threading.Thread(target=writer)
-        t.start()
-        res, _ = self._read(heartbeat_interval=1, idle_limit=5)
-        t.join()
-        self.assertTrue(res["success"])
-        self.assertEqual(res["output"], "chunked")
-
     def test_gives_up_on_total_silence(self):
-        # No data at all: the reader must return an error, not block forever.
+        # No data at all (server open but silent): the reader must return an
+        # error, not block forever.
         t0 = time.time()
-        res, _ = self._read(heartbeat_interval=0.3, idle_limit=0.8)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            res = read_execute_stream(self.client, heartbeat_interval=0.3,
+                                      idle_limit=0.8)
         dt = time.time() - t0
         self.assertFalse(res["success"])
         self.assertIn("gave up", res["error"].lower())
         self.assertLess(dt, 3.0)
+
+    def test_heartbeats_prevent_giveup(self):
+        # A slow-but-alive server that only sends heartbeats must NOT be given
+        # up on; once the result arrives the reader returns it.
+        def writer():
+            for i in range(3):
+                self.server.sendall(
+                    (json.dumps({"type": "heartbeat", "elapsed": i}) + "\n").encode())
+                time.sleep(0.3)
+            self.server.sendall(
+                (json.dumps({"type": "result", "success": True,
+                             "output": "ok", "error": None}) + "\n").encode())
+
+        t = threading.Thread(target=writer)
+        t.start()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            res = read_execute_stream(self.client, heartbeat_interval=0.2,
+                                      idle_limit=0.5)
+        t.join()
+        self.assertTrue(res["success"])
+        self.assertEqual(res["output"], "ok")
 
 
 @unittest.skipUnless(shutil.which("julia"), "julia not on PATH")

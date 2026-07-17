@@ -38,15 +38,15 @@ Or just ask Claude to run Julia code — if you've added the CLAUDE.md instructi
 
 See [SKILL.md](SKILL.md) for full documentation on session management, testing workflows, and advanced options.
 
-## Development
-
-Run the test suite:
+## Running the tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The fast tests drive the server against a controllable stub REPL (no Julia needed)
-and cover the timeout → interrupt → kill/restart self-healing, crash recovery, the
-busy fast-fail, and the streaming protocol. The end-to-end integration test runs the
-real CLI against `julia` and is skipped automatically when Julia isn't on `PATH`.
+The fast tests need no Julia: wire-protocol framing tests use a fake socket, and
+the self-heal tests drive the server against a controllable stub REPL — together
+they cover the streaming protocol and the timeout → interrupt → kill/restart
+recovery, crash recovery, and busy fast-fail. The end-to-end tests drive a real
+Julia process and are skipped automatically when the `julia` binary is not on
+`PATH`.
