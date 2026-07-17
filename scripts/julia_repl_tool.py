@@ -58,19 +58,25 @@ class SessionRegistry:
         callers can distinguish an idle session from one running (or stuck on) a
         long evaluation."""
         port = session_info.get('port')
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2)
             sock.connect(('localhost', port))
             sock.send(json.dumps({"command": "ping"}).encode())
             response = sock.recv(1024).decode()
-            sock.close()
             result = json.loads(response)
             if result.get("status") == "alive":
                 return result
             return None
-        except:
+        except Exception:
             return None
+        finally:
+            # Always close, even when connect/send/recv/parse raises, so listing
+            # or pinging many stale sessions can't leak file descriptors.
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def is_session_alive(self, session_info: Dict[str, Any]) -> bool:
         """Check if a session's server is responsive."""
@@ -321,21 +327,22 @@ class JuliaREPLClient:
 
     def is_server_running(self) -> bool:
         """Check if server is running by pinging it."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2)
             sock.connect(('localhost', self.port))
-            
-            request = {"command": "ping"}
-            sock.send(json.dumps(request).encode())
-            
+            sock.send(json.dumps({"command": "ping"}).encode())
             response = sock.recv(1024).decode()
             result = json.loads(response)
-            sock.close()
-            
             return result.get("status") == "alive"
-        except:
+        except Exception:
             return False
+        finally:
+            # Close on every path so repeated liveness checks can't leak fds.
+            try:
+                sock.close()
+            except Exception:
+                pass
     
     def start_server(self):
         """Start the background server."""

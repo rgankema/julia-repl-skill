@@ -195,8 +195,11 @@ class JuliaREPLServer:
                 return ("eof", lines)
 
             if not rlist:
-                # Silence: reassure the client we're still alive.
-                elapsed = int(now - self._eval_start) if self._eval_start else 0
+                # Silence: reassure the client we're still alive. Recompute the
+                # time *after* the select() wait so `elapsed` doesn't lag by up
+                # to a heartbeat interval during long silences.
+                elapsed = (int(time.time() - self._eval_start)
+                           if self._eval_start else 0)
                 send_json(conn, {"type": "heartbeat", "elapsed": elapsed})
                 continue
 
@@ -394,11 +397,32 @@ class JuliaREPLServer:
             self._eval_start = None
             self.lock.release()
 
+    @staticmethod
+    def _recv_request(conn, timeout=15.0):
+        """Read one JSON request. The client sends a single JSON object and waits
+        for the reply without closing its side, so we accumulate bytes until the
+        buffer parses as JSON rather than assuming it fits in one recv(). A read
+        timeout prevents a silent/partial client from blocking the handler."""
+        conn.settimeout(timeout)
+        buf = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                # Client closed before sending a complete request.
+                return json.loads(buf)  # raises if incomplete -> handled by caller
+            buf += chunk
+            try:
+                return json.loads(buf)
+            except json.JSONDecodeError:
+                continue  # need more bytes
+
     def handle_client(self, conn):
         """Handle one client connection."""
         try:
-            data = conn.recv(65536).decode()
-            request = json.loads(data)
+            request = self._recv_request(conn)
+            # Clear the read timeout: execute streaming can run for a long time
+            # and drives its own deadlines via the Julia read loop.
+            conn.settimeout(None)
             command = request.get("command")
 
             if command == "ping":

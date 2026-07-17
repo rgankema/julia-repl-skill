@@ -171,6 +171,33 @@ class ServerLogicTests(unittest.TestCase):
             self.server.busy_since = None
 
 
+class RequestFramingTests(unittest.TestCase):
+    """The server must reassemble a request that spans multiple packets / exceeds
+    a single recv (e.g. an `execute` carrying a large `code` payload)."""
+
+    def test_large_request_reassembled_across_packets(self):
+        a, b = socket.socketpair()
+        big_code = "x = " + "1 + " * 50_000 + "1"  # comfortably exceeds 64 KiB
+        req = json.dumps(
+            {"command": "execute", "code": big_code, "timeout": 5}).encode()
+        self.assertGreater(len(req), 65536)
+
+        def writer():
+            for i in range(0, len(req), 4096):
+                b.sendall(req[i:i + 4096])
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            got = jrs.JuliaREPLServer._recv_request(a, timeout=10)
+        finally:
+            t.join()
+            a.close()
+            b.close()
+        self.assertEqual(got["command"], "execute")
+        self.assertEqual(got["code"], big_code)
+
+
 class ClientTimeoutTests(unittest.TestCase):
     """The client reader's socket-timeout / give-up behavior, which needs a real
     socket (the deterministic framing matrix lives in test_julia_repl_tool.py)."""
@@ -237,8 +264,13 @@ class IntegrationTests(unittest.TestCase):
     def tearDownClass(cls):
         env = dict(os.environ)
         env["JULIA_SESSION"] = cls.SESSION
-        subprocess.run([sys.executable, str(TOOL), "", "--shutdown"],
-                       capture_output=True, text=True, env=env)
+        # Bound the shutdown: this class exercises hang scenarios, so a regressed
+        # shutdown must not hang the whole test run.
+        try:
+            subprocess.run([sys.executable, str(TOOL), "", "--shutdown"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
 
     def test_end_to_end_hang_and_self_heal(self):
         # 1. Basic execution.
