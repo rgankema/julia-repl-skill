@@ -37,3 +37,13 @@ Once installed, invoke the skill in any Claude Code session:
 Or just ask Claude to run Julia code — if you've added the CLAUDE.md instruction above, it will use the persistent REPL automatically.
 
 See [SKILL.md](SKILL.md) for full documentation on session management, testing workflows, and advanced options.
+
+## Running the tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The wire-protocol framing tests use a fake socket and need no Julia. The
+end-to-end tests drive a real Julia process and are skipped automatically when
+the `julia` binary is not on `PATH`.
