@@ -11,76 +11,8 @@ import os
 import socket
 import signal
 import hashlib
-import codecs
 from pathlib import Path
 from typing import Dict, Any, Optional
-
-
-# Unique sentinel emitted by the server on its own, immediately before the final
-# JSON result. It lets the client separate streamed program output from the
-# result unambiguously, instead of guessing by brace-matching (which breaks
-# because TCP does not preserve send() boundaries and Julia can print braces).
-# This literal MUST stay in sync with the copy embedded in the server script
-# inside JuliaREPLClient.create_server_script().
-RESULT_SENTINEL = "##JULIA_REPL_RESULT_JSON##"
-
-
-def _stream_and_collect(sock, echo: bool = True) -> Optional[Dict[str, Any]]:
-    """Read streamed output followed by the sentinel-delimited JSON result.
-
-    Everything received before RESULT_SENTINEL is streamed program output; when
-    ``echo`` is True it is printed to stdout as it arrives. Everything after the
-    sentinel is accumulated until it parses as JSON, which is returned. Returns
-    None if the connection closes before a complete result is received.
-    """
-    # Incremental decoder so a multibyte UTF-8 character split across TCP
-    # segments is buffered until complete instead of raising UnicodeDecodeError.
-    decoder = codecs.getincrementaldecoder('utf-8')()
-    buffer = ""
-    holdback = len(RESULT_SENTINEL) - 1
-
-    def recv_text():
-        """Return (decoded_text, closed). closed is True at end of stream."""
-        raw = sock.recv(4096)
-        if not raw:
-            return decoder.decode(b'', final=True), True
-        return decoder.decode(raw), False
-
-    # Phase 1: stream output until the sentinel appears.
-    while True:
-        idx = buffer.find(RESULT_SENTINEL)
-        if idx != -1:
-            if echo and idx > 0:
-                print(buffer[:idx], end='', flush=True)
-            buffer = buffer[idx + len(RESULT_SENTINEL):]
-            break
-
-        # No complete sentinel yet. Trim everything except a possible partial
-        # sentinel at the tail (holdback chars) so the buffer can't grow
-        # unbounded; print the trimmed prefix only when echoing.
-        if len(buffer) > holdback:
-            safe = len(buffer) - holdback
-            if echo:
-                print(buffer[:safe], end='', flush=True)
-            buffer = buffer[safe:]
-
-        text, closed = recv_text()
-        if closed:
-            # Connection closed without a sentinel; flush whatever remains.
-            if echo and buffer:
-                print(buffer, end='', flush=True)
-            return None
-        buffer += text
-
-    # Phase 2: accumulate the JSON result until it parses.
-    while True:
-        try:
-            return json.loads(buffer.strip())
-        except json.JSONDecodeError:
-            text, closed = recv_text()
-            if closed:
-                return None
-            buffer += text
 
 
 class SessionRegistry:
@@ -120,24 +52,35 @@ class SessionRegistry:
         except:
             return False
 
-    def is_session_alive(self, session_info: Dict[str, Any]) -> bool:
-        """Check if a session is still alive by checking its PID and server."""
+    def ping_session(self, session_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Ping a session's server. Returns the ping response dict, or None if
+        the server is unreachable. The response includes busy/busy_seconds so
+        callers can distinguish an idle session from one running (or stuck on) a
+        long evaluation."""
         port = session_info.get('port')
-        pid = session_info.get('pid')
-
-        # Check if server is responsive
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
+            sock.settimeout(2)
             sock.connect(('localhost', port))
-            request = {"command": "ping"}
-            sock.send(json.dumps(request).encode())
+            sock.send(json.dumps({"command": "ping"}).encode())
             response = sock.recv(1024).decode()
             result = json.loads(response)
-            sock.close()
-            return result.get("status") == "alive"
-        except:
-            return False
+            if result.get("status") == "alive":
+                return result
+            return None
+        except Exception:
+            return None
+        finally:
+            # Always close, even when connect/send/recv/parse raises, so listing
+            # or pinging many stale sessions can't leak file descriptors.
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def is_session_alive(self, session_info: Dict[str, Any]) -> bool:
+        """Check if a session's server is responsive."""
+        return self.ping_session(session_info) is not None
 
     def allocate_port(self, registry: Dict[str, Dict[str, Any]]) -> int:
         """Allocate an available port in the range 10000-20000."""
@@ -261,7 +204,90 @@ def detect_session_id() -> str:
     return f"{dir_name}_{dir_hash}"
 
 
+def read_execute_stream(sock: socket.socket, heartbeat_interval: float = 5,
+                        echo: bool = True, idle_limit: float = None) -> Dict[str, Any]:
+    """
+    Read an execute response as newline-delimited JSON from `sock`.
+
+    Message types: "output" (streamed text), "heartbeat" (progress during silence),
+    and "result" (terminal). Output is echoed to stdout in real time; heartbeats
+    update a single progress line on stderr. A socket timeout guards against a
+    dead server: if nothing at all (not even a heartbeat) arrives for `idle_limit`
+    seconds, we stop waiting and return an error instead of blocking forever.
+    """
+    if idle_limit is None:
+        idle_limit = max(heartbeat_interval * 4, 20)
+    sock.settimeout(min(heartbeat_interval + 5, idle_limit))
+
+    buffer = b""
+    result = None
+    last_data = time.time()
+    progress_shown = False
+
+    def clear_progress():
+        nonlocal progress_shown
+        if progress_shown:
+            print("", file=sys.stderr, flush=True)
+            progress_shown = False
+
+    while result is None:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            idle = time.time() - last_data
+            if idle >= idle_limit:
+                clear_progress()
+                msg = (f"no output from server for {int(idle)}s; giving up "
+                       f"(session may be stuck — try --reset or --shutdown).")
+                print(f"[julia-repl] {msg}", file=sys.stderr, flush=True)
+                return {"success": False, "output": "",
+                        "error": f"Client gave up: {msg}"}
+            print(f"\r[julia-repl] waiting… {int(idle)}s with no server response",
+                  end="", file=sys.stderr, flush=True)
+            progress_shown = True
+            continue
+
+        if not chunk:
+            break
+        last_data = time.time()
+        buffer += chunk
+
+        while b"\n" in buffer:
+            raw, buffer = buffer.split(b"\n", 1)
+            if not raw.strip():
+                continue
+            try:
+                msg = json.loads(raw.decode(errors="replace"))
+            except json.JSONDecodeError:
+                continue
+
+            mtype = msg.get("type")
+            if mtype == "output":
+                clear_progress()
+                if echo:
+                    print(msg.get("data", ""), end="", flush=True)
+            elif mtype == "heartbeat":
+                elapsed = msg.get("elapsed", 0)
+                note = msg.get("note")
+                label = f" — {note}" if note else ""
+                print(f"\r[julia-repl] running… {elapsed}s{label}          ",
+                      end="", file=sys.stderr, flush=True)
+                progress_shown = True
+            elif mtype == "result":
+                clear_progress()
+                result = msg
+                break
+
+    if result is None:
+        result = {"success": False, "output": "",
+                  "error": "Connection closed before a result was received."}
+    return result
+
+
 class JuliaREPLClient:
+    # Default cadence (seconds) between server heartbeats during silent periods.
+    HEARTBEAT_INTERVAL = 5
+
     def __init__(self, port: Optional[int] = None, session_id: Optional[str] = None, auto_detect: bool = True):
         """
         Initialize Julia REPL client.
@@ -292,277 +318,34 @@ class JuliaREPLClient:
             self.port = 9998
             self.session_id = None
 
-        # Make PID and server script files port-specific
+        # PID file is port-specific; the server script is shipped alongside this
+        # file (see scripts/julia_repl_server.py) rather than generated per-port.
         sessions_dir = Path('/tmp/claude/julia-repl-skill')
         sessions_dir.mkdir(parents=True, exist_ok=True)
         self.pid_file = str(sessions_dir / f'{self.port}.pid')
-        self.server_script = str(sessions_dir / f'{self.port}.py')
-    
-    def create_server_script(self):
-        """Create the background server script."""
-        server_code = '''#!/usr/bin/env python3
-import socket
-import subprocess
-import threading
-import time
-import json
-import sys
-import signal
-import os
+        self.server_script = str(Path(__file__).resolve().parent / 'julia_repl_server.py')
 
-class JuliaREPLServer:
-    def __init__(self, port):
-        self.port = port
-        self.process = None
-        self.lock = threading.Lock()
-        self.running = True
-        
-    def start_julia(self):
-        """Start Julia REPL process."""
-        if self.process:
-            self.stop_julia()
-            
-        self.process = subprocess.Popen(
-            ['julia', '--banner=no', '--color=no', '--startup-file=no'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=0,
-            env=os.environ.copy()
-        )
-        time.sleep(1)  # Wait for Julia to start
-        
-        # Initialize with Revise
-        try:
-            self.process.stdin.write("using Revise\\n")
-            self.process.stdin.flush()
-            time.sleep(2)  # Give Revise time to load
-        except:
-            pass  # Continue even if Revise fails to load
-        
-    def stop_julia(self):
-        """Stop Julia REPL process."""
-        if self.process:
-            try:
-                self.process.stdin.write("exit()\\n")
-                self.process.stdin.flush()
-                self.process.wait(timeout=5)
-            except:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=5)
-                except:
-                    self.process.kill()
-            finally:
-                self.process = None
-                
-    def execute_code_stream(self, conn, request):
-        """Execute Julia code and stream output line by line to client."""
-        with self.lock:
-            if not self.process or self.process.poll() is not None:
-                self.start_julia()
-
-            # Sentinel emitted right before the JSON result so the client can
-            # separate streamed output from the result. MUST match
-            # RESULT_SENTINEL in the client module.
-            result_sentinel = "##JULIA_REPL_RESULT_JSON##"
-            log_handle = None
-            try:
-                code = request["code"]
-                timeout = request.get("timeout", 3600)
-                log_file = request.get("log_file")
-
-                # Open log file if specified
-                if log_file:
-                    log_handle = open(log_file, 'a')
-                    log_handle.write(f"\\n=== Julia Command Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\\n")
-                    log_handle.flush()
-                
-                # First run Revise.revise() then check Revise.errors() before executing user code
-                revise_marker = f"##REVISE_CHECK_{int(time.time() * 1000000)}##"
-                revise_check = f'Revise.revise()\\nRevise.errors()\\nprintln("{revise_marker}")\\n'
-                
-                self.process.stdin.write(revise_check)
-                self.process.stdin.flush()
-                
-                # Collect Revise check output
-                revise_output = []
-                start_time = time.time()
-                
-                while time.time() - start_time < 10:  # 10 second timeout for Revise check
-                    line = self.process.stdout.readline()
-                    if not line:
-                        break
-                        
-                    line = line.rstrip()
-                    if line == revise_marker:
-                        break
-                        
-                    revise_output.append(line)
-                
-                # Now execute the user's code
-                marker = f"##END_MARKER_{int(time.time() * 1000000)}##"
-                full_code = f'{code}\\nprintln("{marker}")\\n'
-                
-                self.process.stdin.write(full_code)
-                self.process.stdin.flush()
-                
-                if log_handle:
-                    log_handle.write(f"Executing: {code}\\n")
-                    log_handle.flush()
-                
-                output_lines = []
-                start_time = time.time()
-                
-                while time.time() - start_time < timeout:
-                    line = self.process.stdout.readline()
-                    if not line:
-                        break
-                        
-                    line = line.rstrip()
-                    if line == marker:
-                        break
-                        
-                    output_lines.append(line)
-                    
-                    # Send line immediately to client for streaming.
-                    # sendall so a long line is transmitted in full.
-                    line_data = line + "\\n"
-                    conn.sendall(line_data.encode())
-                    
-                    if log_handle:
-                        log_handle.write(line + "\\n")
-                        log_handle.flush()
-                
-                if log_handle:
-                    log_handle.write(f"=== Command Completed at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\\n\\n")
-                    log_handle.close()
-                
-                # Send final JSON result, preceded by the sentinel line so the
-                # client can unambiguously find the result boundary.
-                result = {
-                    "success": True,
-                    "output": "\\n".join(output_lines),
-                    "error": None
-                }
-
-                # sendall so partial sends can't corrupt the result framing.
-                conn.sendall(result_sentinel.encode())
-                conn.sendall(json.dumps(result).encode())
-
-            except Exception as e:
-                if log_handle:
-                    log_handle.write(f"ERROR: {str(e)}\\n")
-                    log_handle.close()
-                error_result = {
-                    "success": False,
-                    "output": "",
-                    "error": str(e)
-                }
-                conn.sendall(result_sentinel.encode())
-                conn.sendall(json.dumps(error_result).encode())
-
-    def handle_client(self, conn):
-        """Handle client connection."""
-        try:
-            data = conn.recv(4096).decode()
-            request = json.loads(data)
-
-            if request["command"] == "ping":
-                response = {"status": "alive"}
-                conn.send(json.dumps(response).encode())
-            elif request["command"] == "execute":
-                # Always stream output - connection NOT closed in finally
-                self.execute_code_stream(conn, request)
-                conn.close()  # Close here after streaming is done
-                return
-            elif request["command"] == "reset":
-                self.stop_julia()
-                response = {"status": "reset"}
-                conn.send(json.dumps(response).encode())
-            elif request["command"] == "shutdown":
-                self.running = False
-                response = {"status": "shutting_down"}
-                conn.send(json.dumps(response).encode())
-            else:
-                response = {"error": "unknown_command"}
-                conn.send(json.dumps(response).encode())
-
-        except Exception as e:
-            error_response = {"error": str(e)}
-            conn.send(json.dumps(error_response).encode())
-        finally:
-            conn.close()
-    
-    def run(self):
-        """Run the server."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('localhost', self.port))
-        sock.listen(5)
-        sock.settimeout(1.0)  # Non-blocking accept
-        
-        print(f"Julia REPL server listening on port {self.port}")
-        
-        while self.running:
-            try:
-                conn, addr = sock.accept()
-                threading.Thread(target=self.handle_client, args=(conn,)).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"Server error: {e}")
-                break
-                
-        sock.close()
-        self.stop_julia()
-
-def signal_handler(signum, frame):
-    print("Shutting down server...")
-    sys.exit(0)
-
-if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9998
-    pid_file = sys.argv[2] if len(sys.argv) > 2 else f'/tmp/julia_repl_server_{port}.pid'
-
-    # Write PID file
-    with open(pid_file, 'w') as f:
-        f.write(str(os.getpid()))
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    server = JuliaREPLServer(port)
-    server.run()
-'''
-        
-        with open(self.server_script, 'w') as f:
-            f.write(server_code)
-        os.chmod(self.server_script, 0o755)
-    
     def is_server_running(self) -> bool:
         """Check if server is running by pinging it."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2)
             sock.connect(('localhost', self.port))
-            
-            request = {"command": "ping"}
-            sock.send(json.dumps(request).encode())
-            
+            sock.send(json.dumps({"command": "ping"}).encode())
             response = sock.recv(1024).decode()
             result = json.loads(response)
-            sock.close()
-            
             return result.get("status") == "alive"
-        except:
+        except Exception:
             return False
+        finally:
+            # Close on every path so repeated liveness checks can't leak fds.
+            try:
+                sock.close()
+            except Exception:
+                pass
     
     def start_server(self):
         """Start the background server."""
-        self.create_server_script()
-
         # Start server in background, passing port and PID file path
         process = subprocess.Popen(
             [sys.executable, self.server_script, str(self.port), self.pid_file],
@@ -598,18 +381,12 @@ if __name__ == "__main__":
             request = {"command": command, **kwargs}
             sock.send(json.dumps(request).encode())
 
-            # All execute commands now stream by default
+            # Execute streams newline-delimited JSON messages; use the shared
+            # reader so a dead/stuck server can't hang us (it sets a socket timeout).
             if command == "execute":
-                # Print output in real-time, then collect the JSON result that
-                # follows the sentinel.
-                result = _stream_and_collect(sock, echo=True)
+                heartbeat = kwargs.get("heartbeat", self.HEARTBEAT_INTERVAL)
+                result = read_execute_stream(sock, heartbeat_interval=heartbeat)
                 sock.close()
-                if result is None:
-                    return {
-                        "success": False,
-                        "output": "",
-                        "error": "Connection closed before result was received",
-                    }
                 return result
             else:
                 # Non-execute commands get simple response
@@ -676,9 +453,15 @@ def main():
 
         print("Active Julia REPL sessions:")
         print(f"{'Session ID':<30} {'Port':<8} {'Directory':<40} {'Status'}")
-        print("-" * 90)
+        print("-" * 95)
         for session_id, info in sessions.items():
-            status = "alive" if registry.is_session_alive(info) else "stale"
+            ping = registry.ping_session(info)
+            if ping is None:
+                status = "stale"
+            elif ping.get("busy"):
+                status = f"busy ({ping.get('busy_seconds', 0)}s)"
+            else:
+                status = "idle"
             cwd_short = info.get('cwd', 'unknown')
             if len(cwd_short) > 40:
                 cwd_short = "..." + cwd_short[-37:]
@@ -770,27 +553,22 @@ def main():
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(('localhost', client.port))
 
-        request = {"command": "execute", "code": code, "timeout": timeout, "log_file": log_file}
+        request = {"command": "execute", "code": code, "timeout": timeout,
+                   "log_file": log_file, "heartbeat": client.HEARTBEAT_INTERVAL}
         sock.send(json.dumps(request).encode())
 
-        # Stream output in real-time and collect the final JSON result, which is
-        # delimited by RESULT_SENTINEL so it never leaks into stdout.
-        result = _stream_and_collect(sock, echo=True)
+        result = read_execute_stream(sock, heartbeat_interval=client.HEARTBEAT_INTERVAL)
         sock.close()
-
-        # Surface a failing status (output has already been streamed above).
-        if result is None:
-            # Connection closed before the sentinel/JSON result arrived.
-            print("Error: connection closed before result was received",
-                  file=sys.stderr)
-            sys.exit(1)
-        if not result.get("success", True):
-            error = result.get("error")
-            if error:
-                print(f"Error: {error}", file=sys.stderr)
-            sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Surface a clear error and a non-zero exit code on timeout/failure so callers
+    # can tell a wedged/failed run from a clean one.
+    if not result.get("success", False):
+        err = result.get("error")
+        if err:
+            print(f"\n[julia-repl] {err}", file=sys.stderr)
         sys.exit(1)
 
 

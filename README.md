@@ -41,9 +41,12 @@ See [SKILL.md](SKILL.md) for full documentation on session management, testing w
 ## Running the tests
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests -v
 ```
 
-The wire-protocol framing tests use a fake socket and need no Julia. The
-end-to-end tests drive a real Julia process and are skipped automatically when
-the `julia` binary is not on `PATH`.
+The fast tests need no Julia: wire-protocol framing tests use a fake socket, and
+the self-heal tests drive the server against a controllable stub REPL — together
+they cover the streaming protocol and the timeout → interrupt → kill/restart
+recovery, crash recovery, and busy fast-fail. The end-to-end tests drive a real
+Julia process and are skipped automatically when the `julia` binary is not on
+`PATH`.
